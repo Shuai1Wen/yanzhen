@@ -94,7 +94,8 @@ class ODEIntegrator:
         t_span: torch.Tensor = None,
         library_size: torch.Tensor = None,
         rtol: float = 1e-5,
-        atol: float = 1e-6
+        atol: float = 1e-6,
+        with_grad: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         模拟单细胞轨迹
@@ -108,6 +109,7 @@ class ODEIntegrator:
             library_size: 库大小 (batch_size,)，默认为1.0
             rtol: ODE求解相对容差
             atol: ODE求解绝对容差
+            with_grad: 是否保留梯度用于反向传播（默认False，推理时使用；设为True用于微调）
         
         Returns:
             (traj_z, traj_mean, trajectory_info)
@@ -149,7 +151,9 @@ class ODEIntegrator:
         self.model.eval()
         
         # ODE求解
-        with torch.no_grad():
+        # 根据with_grad决定是否保留梯度用于后续微调
+        if with_grad:
+            # 保留梯度用于反向传播（例如用于微调）
             traj_z = odeint(
                 ode_func,
                 z_initial,
@@ -158,6 +162,17 @@ class ODEIntegrator:
                 rtol=rtol,
                 atol=atol
             )
+        else:
+            # 标准推理模式，不计算梯度以节省内存
+            with torch.no_grad():
+                traj_z = odeint(
+                    ode_func,
+                    z_initial,
+                    t_span,
+                    method=self.solver,
+                    rtol=rtol,
+                    atol=atol
+                )
         
         # traj_z: (n_timepoints, batch_size, n_latent)
         

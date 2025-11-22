@@ -89,8 +89,31 @@ class NBLoss(nn.Module):
         # 组合所有项得到对数似然
         log_likelihood = term1 + term2 + term3
         
+        # 数值检查：检测NAN和INF
+        if torch.any(torch.isnan(log_likelihood)) or torch.any(torch.isinf(log_likelihood)):
+            print(f"[警告] NB对数似然包含异常值")
+            print(f"  term1 范围: [{term1.min().item():.4f}, {term1.max().item():.4f}]")
+            print(f"  term2 范围: [{term2.min().item():.4f}, {term2.max().item():.4f}]")
+            print(f"  term3 范围: [{term3.min().item():.4f}, {term3.max().item():.4f}]")
+            print(f"  x范围: [{x.min().item():.4f}, {x.max().item():.4f}]")
+            print(f"  mean范围: [{mean.min().item():.4f}, {mean.max().item():.4f}]")
+            print(f"  theta范围: [{theta.min().item():.4f}, {theta.max().item():.4f}]")
+            # 替换异常值为0（相当于该样本被忽略）
+            log_likelihood = torch.where(
+                torch.isfinite(log_likelihood), 
+                log_likelihood, 
+                torch.zeros_like(log_likelihood)
+            )
+        
         # 返回负对数似然的平均值（最小化）
-        return -torch.mean(log_likelihood)
+        neg_log_likelihood = -torch.mean(log_likelihood)
+        
+        # 最终检查
+        if not torch.isfinite(neg_log_likelihood):
+            print(f"[错误] NB Loss最终结果非有限: {neg_log_likelihood.item()}")
+            neg_log_likelihood = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        
+        return neg_log_likelihood
 
 
 class KLDivergenceLoss(nn.Module):
@@ -127,16 +150,47 @@ class KLDivergenceLoss(nn.Module):
         
         Returns:
             KL散度（标量或求和）
+        
+        数值稳定性说明：
+        - 限制logvar防止exp爆炸
+        - 限制mu防止平方爆炸
+        - 使用clamp避免极端值
         """
+        # 数值稳定性：限制logvar范围
+        # 当logvar > 20时，exp(logvar)会爆炸
+        logvar_safe = torch.clamp(logvar, max=20.0)
+        
+        # 限制mu的范围防止平方爆炸
+        # 当|mu| > 100时开始警告
+        mu_safe = torch.clamp(mu, min=-100.0, max=100.0)
+        
         # KL = -0.5 * Σ(1 + logvar - mu^2 - exp(logvar))
-        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+        kl = -0.5 * torch.sum(
+            1 + logvar_safe - mu_safe.pow(2) - logvar_safe.exp(), 
+            dim=1
+        )
+        
+        # 检查NAN和INF
+        if torch.any(torch.isnan(kl)) or torch.any(torch.isinf(kl)):
+            print("[警告] KL损失包含NAN或INF值")
+            print(f"  mu范围: [{mu.min().item():.4f}, {mu.max().item():.4f}]")
+            print(f"  logvar范围: [{logvar.min().item():.4f}, {logvar.max().item():.4f}]")
+            # 用0替换异常值（温和的处理）
+            kl = torch.where(torch.isfinite(kl), kl, torch.zeros_like(kl))
         
         if self.reduction == 'mean':
-            return torch.mean(kl)
+            result = torch.mean(kl)
         elif self.reduction == 'sum':
-            return torch.sum(kl)
+            result = torch.sum(kl)
         else:
-            return kl
+            result = kl
+        
+        # 最后检查
+        if not torch.isfinite(result).all():
+            print(f"[错误] KL结果非有限: {result}")
+            result = torch.tensor(0.0, device=result.device, dtype=result.dtype)
+        
+        return result
 
 
 class FlowMatchingLoss(nn.Module):

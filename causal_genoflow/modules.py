@@ -301,9 +301,11 @@ class CorrectedGNNVectorField(nn.Module):
         
         # Step 1: 可学习的基因嵌入矩阵
         # 形状：(n_genes, n_hidden)
+        # 使用Xavier初始化保证稳定的梯度流
         self.gene_embeddings = nn.Parameter(
-            torch.randn(n_genes, n_hidden) * 0.01
+            torch.empty(n_genes, n_hidden)
         )
+        nn.init.xavier_uniform_(self.gene_embeddings, gain=1.0)
         
         # Step 2: 图注意力网络
         # 输入：(n_genes, n_hidden) -> 输出：(n_genes, n_hidden*2)
@@ -380,7 +382,15 @@ class CorrectedGNNVectorField(nn.Module):
         
         # 注意力分数：[batch_size, n_genes]
         # 代表：这个细胞状态对哪些基因更"感兴趣"
-        attn_scores = torch.matmul(Q, K.t()) / (K.shape[1] ** 0.5)
+        # 
+        # 维度分析：
+        # Q: (batch, n_hidden*2)
+        # K.t(): (n_hidden*2, n_genes) 
+        # 结果: (batch, n_genes) ✓
+        #
+        # 缩放：应该按照d_k的维度缩放，即sqrt(n_hidden*2)
+        d_k = Q.shape[-1]  # n_hidden*2
+        attn_scores = torch.matmul(Q, K.t()) / (d_k ** 0.5)
         attn_weights = F.softmax(attn_scores, dim=-1)
         
         # 聚合基因背景信息：[batch_size, n_hidden*2]

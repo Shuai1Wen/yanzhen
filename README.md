@@ -427,22 +427,113 @@ with torch.no_grad():
     mean, theta = model.decode(z, C, library_size)
 ```
 
-## 7. 常见问题
+## 7. 常见问题与故障排除
+
+### Q: 训练时出现NAN损失？
+
+**原因分析**：
+1. **NB Loss中的数值溢出**
+   - 当μ或θ极端值时会导致lgamma爆炸
+   - 当计数x非常大时会导致溢出
+2. **KL散度中的exp爆炸**
+   - 当logvar > 20时，exp(logvar)会非常大
+   - 当mu非常大时，mu²会溢出
+3. **OT标准化产生的NAN**
+   - 当某维度的std=0时会出现除以0
+   - 当数据包含极端异常值时标准化失败
+
+**解决方案**：
+- 模型已包含自动的数值检查和修复（参见losses.py L93-116）
+- 监控输出日志中的[警告]和[错误]消息
+- 如果仍然出现NAN，检查输入数据的范围：
+  ```python
+  print(f"计数范围: [{X.min()}, {X.max()}]")
+  print(f"library_size范围: [{L.min()}, {L.max()}]")
+  ```
+
+### Q: 梯度消失或梯度爆炸？
+
+**诊断方法**：
+```python
+# 在训练过程中检查梯度健康状况
+grad_norms, has_nan, has_zero = TwoStageTrainer.check_gradients(
+    model, 
+    phase_name="Phase 1, Epoch 10"
+)
+
+# 输出梯度统计
+for name, grad_norm in grad_norms.items():
+    if grad_norm > 0:
+        print(f"{name}: {grad_norm:.4e}")
+```
+
+**常见原因和修复**：
+1. **梯度为零（梯度断裂）**
+   - 可能原因：某层参数未连接到损失，或使用了detach()
+   - 检查：确保all parameters require_grad=True
+   - 修复：检查梯度流是否正确连接
+   
+2. **梯度过小（消失）**
+   - 原因：网络过深或初始化不合理
+   - 症状：模型不学习，损失不下降
+   - 修复：减少网络深度或使用更好的初始化（已改进为Xavier）
+   
+3. **梯度过大（爆炸）**
+   - 原因：学习率过高或loss scale不合理
+   - 症状：损失震荡或变成NAN
+   - 修复：降低学习率，使用梯度裁剪：
+   ```python
+   torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+   ```
+
+### Q: Phase 2训练时OT计算失败？
+
+**常见错误**：
+- "空的潜变量集合"：某个时间点的细胞太少(<10)
+- "标签超出范围"：条件编码格式错误
+- OT矩阵产生NAN：Z-score标准化失败
+
+**解决方案**：
+```python
+# 检查时间分布
+print(torch.bincount(time_labels))  # 每个时间点的细胞数
+
+# 确保条件编码正确
+print(C.shape, C.sum(dim=1))  # 应该都是1（独热）或[0,n_cond)（标签）
+
+# 如果仍有问题，增加数据或减少时间点数
+```
 
 ### Q: 如何处理缺失值？
 A: 在预处理阶段将缺失值设为0（视为未检测）。NB分布能够妥善处理零计数。
 
 ### Q: 是否需要数据标准化？
-A: 在编码器输入前使用log1p归一化。对于OT计算，需要对潜变量Z进行Z-score标准化（已在trainer中自动处理）。
+A: 在编码器输入前使用log1p归一化。对于OT计算，需要对潜变量Z进行Z-score标准化（已在trainer中自动处理，包括数值稳定性保护）。
 
 ### Q: GRN有多稀疏/密集的上限？
 A: 模型支持任何密度。对于非常稀疏的GRN，某些基因可能未被约束；对于密集网络，交叉注意力会自动学习关键连接。
 
 ### Q: Phase 1需要多少个epoch？
-A: 通常100-200个。监测验证集的重建损失和KL散度，当KL损失趋于稳定时可停止。
+A: 通常100-200个。监测验证集的重建损失和KL散度，当KL损失趋于稳定时可停止。监测梯度范数以确保学习中...
 
 ### Q: 如何调整λ_adv？
-A: 从0.01开始。如果z仍包含条件信息，增加λ_adv；如果损失震荡，降低λ_adv。
+A: 从0.01开始。如果z仍包含条件信息，增加λ_adv；如果损失震荡，降低λ_adv。使用梯度检查工具监控对抗训练的稳定性。
+
+### Q: 模型收敛很慢？
+
+**诊断**：
+- 检查学习率是否太小
+- 检查批大小是否太小（建议≥32）
+- 检查是否有梯度消失（见上面的梯度问题）
+
+**改进建议**：
+- 先用较小数据集（1000-5000细胞）验证
+- 逐步增加batch_size（32→64→128）
+- 使用学习率调度：
+  ```python
+  from torch.optim.lr_scheduler import ReduceLROnPlateau
+  scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10)
+  ```
 
 ## 8. 推荐配置
 

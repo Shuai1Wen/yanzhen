@@ -35,6 +35,42 @@ class TwoStageTrainer:
     - 训练Vector Field (Flow Matching)
     """
     
+    @staticmethod
+    def check_gradients(model, phase_name: str = ""):
+        """
+        检查模型梯度的健康状况
+        
+        诊断梯度消失、梯度爆炸或梯度断裂的问题
+        
+        Args:
+            model: PyTorch模型
+            phase_name: 调试阶段名称
+        """
+        grad_norms = {}
+        has_nan_grad = False
+        has_zero_grad = False
+        
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad_norm = torch.norm(param.grad).item()
+                grad_norms[name] = grad_norm
+                
+                if torch.any(torch.isnan(param.grad)):
+                    print(f"[梯度错误] {name} 包含NAN梯度 ({phase_name})")
+                    has_nan_grad = True
+                
+                if grad_norm == 0:
+                    print(f"[梯度警告] {name} 梯度为零 ({phase_name})")
+                    has_zero_grad = True
+                
+                elif grad_norm < 1e-7:
+                    print(f"[梯度警告] {name} 梯度过小: {grad_norm:.2e} ({phase_name})")
+                
+                elif grad_norm > 1e2:
+                    print(f"[梯度警告] {name} 梯度过大: {grad_norm:.2e} ({phase_name})")
+        
+        return grad_norms, has_nan_grad, has_zero_grad
+    
     def __init__(
         self,
         model: nn.Module,
@@ -159,14 +195,28 @@ class TwoStageTrainer:
                     z_detached = z.detach()
                     disc_logits = self.model.discriminator(z_detached)
                     
-                    # 条件标签（假设C已经是独热或可以转换为标签）
-                    # 这里简化处理：假设C的argmax给出标签
+                    # 条件标签转换
+                    # 必须确定C的格式：独热编码或标签索引
                     if batch_c.ndim > 1:
-                        c_labels = torch.argmax(batch_c, dim=1)
+                        # 假设是独热编码 (batch, n_cond)
+                        if batch_c.shape[1] > 1:
+                            # 多个1表示不是严格独热编码，尝试转换
+                            c_labels = torch.argmax(batch_c, dim=1)
+                        else:
+                            # 只有一列，直接作为标签
+                            c_labels = batch_c.squeeze(1).long()
                     else:
+                        # 已经是标签
                         c_labels = batch_c.long()
                     
-                    loss_disc = F.cross_entropy(disc_logits, c_labels)
+                    # 安全检查：标签范围应该在[0, n_cond)
+                    if torch.any(c_labels < 0) or torch.any(c_labels >= batch_c.shape[-1]):
+                        print(f"[警告] 条件标签超出范围: min={c_labels.min()}, max={c_labels.max()}, expected=[0, {batch_c.shape[-1]})")
+                        # 跳过此批的判别器训练
+                        loss_disc = torch.tensor(0.0, device=batch_c.device)
+                    else:
+                        loss_disc = F.cross_entropy(disc_logits, c_labels)
+                    
                     loss_disc.backward()
                     optimizer_disc.step()
                     
@@ -264,8 +314,36 @@ class TwoStageTrainer:
         print(f"[OT] 源分布大小: {Z_source.shape[0]}, 目标分布大小: {Z_target.shape[0]}")
         
         # Z-score标准化（details.txt第36行要求）
-        Z_source_norm = (Z_source - Z_source.mean(dim=0)) / (Z_source.std(dim=0) + 1e-8)
-        Z_target_norm = (Z_target - Z_target.mean(dim=0)) / (Z_target.std(dim=0) + 1e-8)
+        # 数值稳定性处理：
+        # 1. 检查是否为空
+        # 2. 处理std=0的情况
+        # 3. 防止NAN传播
+        
+        if Z_source.shape[0] == 0 or Z_target.shape[0] == 0:
+            raise ValueError(f"空的潜变量集合: Z_source={Z_source.shape}, Z_target={Z_target.shape}")
+        
+        # 计算统计量
+        source_mean = Z_source.mean(dim=0, keepdim=True)
+        source_std = Z_source.std(dim=0, keepdim=True)
+        target_mean = Z_target.mean(dim=0, keepdim=True)
+        target_std = Z_target.std(dim=0, keepdim=True)
+        
+        # 处理std=0的情况（某个维度方差为0）
+        # 用小值替换以避免除以0
+        source_std = torch.clamp(source_std, min=1e-8)
+        target_std = torch.clamp(target_std, min=1e-8)
+        
+        Z_source_norm = (Z_source - source_mean) / source_std
+        Z_target_norm = (Z_target - target_mean) / target_std
+        
+        # 检查是否产生了NAN
+        if torch.any(torch.isnan(Z_source_norm)) or torch.any(torch.isnan(Z_target_norm)):
+            print(f"[警告] OT标准化后包含NAN")
+            print(f"  Z_source_norm NAN数量: {torch.sum(torch.isnan(Z_source_norm)).item()}")
+            print(f"  Z_target_norm NAN数量: {torch.sum(torch.isnan(Z_target_norm)).item()}")
+            # 用0替换NAN（该维度被忽略）
+            Z_source_norm = torch.where(torch.isnan(Z_source_norm), torch.zeros_like(Z_source_norm), Z_source_norm)
+            Z_target_norm = torch.where(torch.isnan(Z_target_norm), torch.zeros_like(Z_target_norm), Z_target_norm)
         
         # 计算成本矩阵（欧氏距离平方）
         Z_source_np = Z_source_norm.numpy()
