@@ -370,7 +370,11 @@ class CorrectedGNNVectorField(nn.Module):
         """
         # Step A: 处理基因图（独立于批大小）
         # graph_feat: (n_genes, n_hidden*2)
-        graph_feat = self.gat(self.gene_embeddings, self.edge_index)
+        # 当未提供GRN或边为空时，跳过GAT以避免维度错误
+        if self.edge_index is None or self.edge_index.numel() == 0:
+            graph_feat = self.gene_embeddings
+        else:
+            graph_feat = self.gat(self.gene_embeddings, self.edge_index)
         
         # Step B: 交叉注意力（细胞查看基因）
         # Query: 细胞状态 (batch_size, n_hidden*2)
@@ -538,7 +542,8 @@ class CausalGenoFlow(nn.Module):
         self,
         x: torch.Tensor,
         c: torch.Tensor,
-        library_size: torch.Tensor
+        library_size: torch.Tensor,
+        detach_adv: bool = False
     ) -> tuple:
         """
         VAE前向传播（用于Phase 1训练）
@@ -550,6 +555,10 @@ class CausalGenoFlow(nn.Module):
         
         Returns:
             (loss, z, mean_recon, theta_recon, mu_z, logvar_z)
+
+        detach_adv:
+            - False: 允许对抗损失的梯度回传到编码器，驱动解耦
+            - True: 仅用于推理或判别器训练，避免对抗项影响编码器
         """
         # 1. 编码：x, c -> z
         x_log = torch.log1p(x)  # Log归一化输入
@@ -561,7 +570,8 @@ class CausalGenoFlow(nn.Module):
         
         # 3. 计算VAE损失
         if self.use_adversarial:
-            adv_logits = self.discriminator(z.detach())
+            adv_input = z.detach() if detach_adv else z
+            adv_logits = self.discriminator(adv_input)
         else:
             adv_logits = None
         

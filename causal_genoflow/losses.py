@@ -43,9 +43,9 @@ class NBLoss(nn.Module):
         self.eps = eps
     
     def forward(
-        self, 
-        x: torch.Tensor, 
-        mean: torch.Tensor, 
+        self,
+        x: torch.Tensor,
+        mean: torch.Tensor,
         theta: torch.Tensor
     ) -> torch.Tensor:
         """
@@ -66,6 +66,9 @@ class NBLoss(nn.Module):
         # 广播theta到正确的维度（如果是基因特异性）
         if theta.ndim == 1:
             theta = theta.unsqueeze(0)  # 从 (n_genes,) -> (1, n_genes)
+
+        # 限制θ的范围，避免梯度爆炸或退化为0（model.txt中的约束）
+        theta = torch.clamp(theta, min=1e-4, max=1e4)
         
         # 数值稳定的log计算，防止log(0)或log负数
         log_theta_mu_eps = torch.log(theta + mean + self.eps)
