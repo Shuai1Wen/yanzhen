@@ -189,7 +189,8 @@ class ODEIntegrator:
         library_size_rep = library_size.repeat(n_timepoints)
         
         # 解码
-        with torch.no_grad():
+        decode_ctx = torch.no_grad() if not with_grad else torch.enable_grad()
+        with decode_ctx:
             mean_flat, theta_flat = self.model.decode(
                 traj_z_flat,
                 condition_rep,

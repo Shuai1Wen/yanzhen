@@ -362,6 +362,17 @@ python verify_implementation.py
 python -c "from causal_genoflow import *; print('✓ 模块导入成功')"
 ```
 
+### 数值稳定与梯度故障排查
+
+- **负二项参数范围**：`NBLoss` 会自动将离散度 θ 限制在 `[1e-4, 1e4]`，可有效避免梯度爆炸或 θ→0 造成的 NaN。【F:causal_genoflow/losses.py†L42-L75】
+- **梯度失效/断裂**：训练阶段可调用 `TwoStageTrainer.check_gradients(model, phase_name)` 检查梯度范数、NAN 以及全零梯度，定位梯度消失或断连位置。【F:causal_genoflow/trainer.py†L15-L64】
+- **对抗链路完整性**：先用无梯度编码训练判别器，再冻结判别器参数并调用 `vae_forward(..., detach_adv=False)` 更新VAE，保证对抗损失只影响编码器且梯度不断裂。【F:causal_genoflow/trainer.py†L169-L248】【F:causal_genoflow/modules.py†L520-L570】
+- **OT 计算设备切换**：OT（Sinkhorn/EMD）内部自动将潜变量移至 CPU 后再转 NumPy，避免 GPU→NumPy 引发的设备错误或 NaN 传播。【F:causal_genoflow/trainer.py†L130-L188】
+- **ODE 推理的梯度保留**：在 `ODEIntegrator.simulate_trajectory(..., with_grad=True)` 时解码阶段不再强制 `no_grad`，可在需要微调或对轨迹求梯度时保持梯度链路，避免梯度断裂。【F:causal_genoflow/inference.py†L84-L140】
+- **GRN 缺失时的向量场稳健性**：若未提供 GRN 边或边集为空，向量场会跳过 GAT 卷积直接使用可学习的基因嵌入，避免空图导致的维度错误或 NaN。【F:causal_genoflow/modules.py†L112-L165】
+- **非有限损失防护**：Phase 1/Phase 2 训练循环在判别器、VAE 和流匹配损失出现 NaN/Inf 时会跳过该批次更新，防止异常梯度污染整体模型。【F:causal_genoflow/trainer.py†L170-L235】【F:causal_genoflow/trainer.py†L416-L471】
+- **配对向量化与内存削峰**：OT 配对后立即向量化堆叠为 `TensorDataset` 并交由 `DataLoader` 随机取批，减少大量小张量拼接带来的回退和显存碎片，便于稳定复现。【F:causal_genoflow/trainer.py†L404-L471】
+
 ### 单元测试
 
 ```python

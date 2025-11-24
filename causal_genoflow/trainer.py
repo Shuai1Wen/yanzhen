@@ -165,36 +165,27 @@ class TwoStageTrainer:
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             n_batches = 0
-            
+
             pbar = tqdm.tqdm(dataloader, disable=not verbose)
             for batch_x, batch_c, batch_l in pbar:
                 batch_x = batch_x.to(self.device)
                 batch_c = batch_c.to(self.device)
                 batch_l = batch_l.to(self.device)
-                
+
                 # ==================
-                # 1. 训练VAE
+                # 1. 训练判别器
                 # ==================
-                optimizer_vae.zero_grad()
-                
-                # VAE前向传播
-                loss_vae, z, mean_recon, theta_recon, mu_z, logvar_z = \
-                    self.model.vae_forward(batch_x, batch_c, batch_l)
-                
-                # 不包含对抗项的VAE损失（先单独算）
-                vae_base_loss = loss_vae
-                
-                # 对抗损失（如果启用）
                 if self.model.use_adversarial:
-                    # ==================
-                    # 2. 训练判别器
-                    # ==================
                     optimizer_disc.zero_grad()
-                    
-                    # 判别器看真实条件
-                    z_detached = z.detach()
+
+                    # 使用无梯度编码获取稳定的判别器输入，避免污染VAE梯度
+                    with torch.no_grad():
+                        x_log = torch.log1p(batch_x)
+                        mu_z_det, logvar_z_det = self.model.encoder(x_log, batch_c)
+                        z_detached = self.model.encoder.reparameterize(mu_z_det, logvar_z_det).detach()
+
                     disc_logits = self.model.discriminator(z_detached)
-                    
+
                     # 条件标签转换
                     # 必须确定C的格式：独热编码或标签索引
                     if batch_c.ndim > 1:
@@ -208,47 +199,57 @@ class TwoStageTrainer:
                     else:
                         # 已经是标签
                         c_labels = batch_c.long()
-                    
+
                     # 安全检查：标签范围应该在[0, n_cond)
-                    if torch.any(c_labels < 0) or torch.any(c_labels >= batch_c.shape[-1]):
-                        print(f"[警告] 条件标签超出范围: min={c_labels.min()}, max={c_labels.max()}, expected=[0, {batch_c.shape[-1]})")
-                        # 跳过此批的判别器训练
+                    n_conditions = disc_logits.shape[1]
+                    if torch.any(c_labels < 0) or torch.any(c_labels >= n_conditions):
+                        print(f"[警告] 条件标签超出范围: min={c_labels.min()}, max={c_labels.max()}, expected=[0, {n_conditions})")
                         loss_disc = torch.tensor(0.0, device=batch_c.device)
                     else:
                         loss_disc = F.cross_entropy(disc_logits, c_labels)
-                    
-                    loss_disc.backward()
-                    optimizer_disc.step()
-                    
-                    # ==================
-                    # 3. 对抗训练编码器
-                    # ==================
-                    # 编码器试图欺骗判别器
-                    optimizer_vae.zero_grad()
-                    disc_logits_gen = self.model.discriminator(z)
-                    
-                    # 对抗损失：最大化判别器的熵（让其无法确定条件）
-                    probs = F.softmax(disc_logits_gen, dim=1)
-                    entropy = -torch.sum(probs * F.log_softmax(disc_logits_gen, dim=1), dim=1)
-                    loss_adv = -torch.mean(entropy)
-                    
-                    # 总损失
-                    total_loss = vae_base_loss + self.lambda_adv * loss_adv
+
+                    # 避免NAN/INF污染后续梯度链路
+                    if torch.isfinite(loss_disc):
+                        loss_disc.backward()
+                        optimizer_disc.step()
+                    else:
+                        print("[警告] 判别器损失出现非有限值，跳过本批次更新")
+
+                    # 判别器冻结，防止生成器更新时梯度泄漏到判别器参数
+                    for param in self.model.discriminator.parameters():
+                        param.requires_grad = False
+
+                # ==================
+                # 2. 训练VAE（含对抗解耦）
+                # ==================
+                optimizer_vae.zero_grad()
+
+                loss_vae, z, mean_recon, theta_recon, mu_z, logvar_z = \
+                    self.model.vae_forward(batch_x, batch_c, batch_l, detach_adv=False)
+
+                total_loss = loss_vae
+
+                # 保护梯度链路，遇到NAN/INF时跳过，避免将错误扩散到参数
+                if torch.isfinite(total_loss):
+                    total_loss.backward()
+                    optimizer_vae.step()
                 else:
-                    total_loss = vae_base_loss
-                
-                total_loss.backward()
-                optimizer_vae.step()
-                
+                    print("[警告] VAE总损失为非有限值，跳过该批次以防梯度污染")
+
+                if self.model.use_adversarial:
+                    # 重新开放判别器梯度，供下一批次使用
+                    for param in self.model.discriminator.parameters():
+                        param.requires_grad = True
+
                 epoch_loss += total_loss.item()
                 n_batches += 1
-                
+
                 if verbose:
                     pbar.set_description(f"Epoch {epoch+1}/{num_epochs} Loss: {total_loss.item():.4f}")
-            
-            avg_loss = epoch_loss / n_batches
+
+            avg_loss = epoch_loss / max(n_batches, 1)
             self.history['phase1'].append(avg_loss)
-            
+
             if verbose and (epoch + 1) % 10 == 0:
                 print(f"[Epoch {epoch+1}] 平均损失: {avg_loss:.4f}")
         
@@ -346,8 +347,9 @@ class TwoStageTrainer:
             Z_target_norm = torch.where(torch.isnan(Z_target_norm), torch.zeros_like(Z_target_norm), Z_target_norm)
         
         # 计算成本矩阵（欧氏距离平方）
-        Z_source_np = Z_source_norm.numpy()
-        Z_target_np = Z_target_norm.numpy()
+        # Sinkhorn要求CPU上的NumPy数组
+        Z_source_np = Z_source_norm.detach().cpu().numpy()
+        Z_target_np = Z_target_norm.detach().cpu().numpy()
         
         cost_matrix = ot.dist(Z_source_np, Z_target_np, metric='euclidean')
         
@@ -428,10 +430,9 @@ class TwoStageTrainer:
         # 获取时间点
         unique_times = sorted(torch.unique(time_labels).tolist())
         print(f"[Phase 2] 发现的时间点: {unique_times}")
-        
+
         # 为每对相邻时间点计算OT耦合
         all_pairs = []
-        all_t_values = []
         
         for t_idx in range(len(unique_times) - 1):
             t_A = unique_times[t_idx]
@@ -455,65 +456,57 @@ class TwoStageTrainer:
                 z0 = Z_A[i:i+1]
                 z1 = Z_B[j:j+1]
                 c = C_A[i:i+1]
-                t = torch.tensor([(t_A + t_B) / 2.0])  # 使用中点作为时间
-                
-                all_pairs.append((z0, z1, c, t))
-                all_t_values.append(t.item())
-        
+
+                all_pairs.append((z0, z1, c))
+
         print(f"[Phase 2] 生成了 {len(all_pairs)} 个训练对")
-        
+
+        if len(all_pairs) == 0:
+            raise ValueError("Phase 2 构建的训练对为空，请检查时间标签或OT计算结果")
+
+        # 向量化存储训练对，减少Python循环和内存碎片
+        z0_all = torch.cat([pair[0] for pair in all_pairs], dim=0)
+        z1_all = torch.cat([pair[1] for pair in all_pairs], dim=0)
+        c_all = torch.cat([pair[2] for pair in all_pairs], dim=0)
+
+        pair_dataset = TensorDataset(z0_all, z1_all, c_all)
+        pair_loader = DataLoader(pair_dataset, batch_size=batch_size, shuffle=True)
+
         # 训练Loop
         self.model.train()
-        
+
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             n_batches = 0
-            
-            # 随机打乱对
-            indices = np.random.permutation(len(all_pairs))
-            
-            pbar = tqdm.tqdm(range(0, len(indices), batch_size), disable=not verbose)
-            for batch_start in pbar:
-                batch_end = min(batch_start + batch_size, len(indices))
-                batch_indices = indices[batch_start:batch_end]
-                
-                # 收集批数据
-                batch_z0_list = []
-                batch_z1_list = []
-                batch_c_list = []
-                batch_t_list = []
-                
-                for idx in batch_indices:
-                    z0, z1, c, t = all_pairs[idx]
-                    batch_z0_list.append(z0)
-                    batch_z1_list.append(z1)
-                    batch_c_list.append(c)
-                    batch_t_list.append(t)
-                
-                batch_z0 = torch.cat(batch_z0_list, dim=0).to(self.device)
-                batch_z1 = torch.cat(batch_z1_list, dim=0).to(self.device)
-                batch_c = torch.cat(batch_c_list, dim=0).to(self.device)
-                batch_t = torch.cat(batch_t_list, dim=0).to(self.device)
-                
+
+            pbar = tqdm.tqdm(pair_loader, disable=not verbose)
+            for batch_z0, batch_z1, batch_c in pbar:
+                batch_z0 = batch_z0.to(self.device)
+                batch_z1 = batch_z1.to(self.device)
+                batch_c = batch_c.to(self.device)
+
                 # 随机时间采样 (details.txt第106行)
                 t_random = torch.rand(batch_z0.shape[0], device=self.device)
-                
+
                 # 线性插值 (model.txt第70行)
                 batch_z_t = (1 - t_random.unsqueeze(1)) * batch_z0 + \
                             t_random.unsqueeze(1) * batch_z1
                 
                 # 目标向量 (model.txt第72行)
                 batch_u_target = batch_z1 - batch_z0
-                
+
                 # 前向传播
                 optimizer_flow.zero_grad()
                 batch_v_pred = self.model.vector_field(t_random, batch_z_t, batch_c)
                 
                 # 流匹配损失 (model.txt第75行)
                 loss_fm = self.model.fm_loss(batch_v_pred, batch_u_target)
-                loss_fm.backward()
-                optimizer_flow.step()
-                
+                if torch.isfinite(loss_fm):
+                    loss_fm.backward()
+                    optimizer_flow.step()
+                else:
+                    print("[警告] 流匹配损失为非有限值，跳过本批次防止梯度失效")
+
                 epoch_loss += loss_fm.item()
                 n_batches += 1
                 
